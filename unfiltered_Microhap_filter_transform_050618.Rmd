@@ -1,0 +1,441 @@
+---
+title: "vcfR_Microhap_filter_transform"
+output: html_notebook
+---
+
+Microhaplotype import, analysis, filtering, and genotype calling
+Phil Morin,  May 2018
+
+
+(1) ##################################################################
+Load packages and unfiltered microhaplotype file from the R-shiny app "Microhaplot". 
+If there are loci with N's in the haplotypes, use the scripts in Rscripts "Microhaplot_remove_N_SNPs.R" by Eric Anderson to screen out loci with x% N's
+Use description for output file names.
+```{r}
+rm(list = ls())
+library(vcfR)
+library(pinfsc50)
+library(reshape2)
+library(ggplot2)
+library(strataG)
+library(tidyverse)
+library(dplyr)
+library(easyGgplot2)
+library(gdata)
+
+description = "10pcN_observed_unfiltered_haplotype_250518"
+microhap_report = read.csv("10pcN_observed_unfiltered_haplotype_250518.csv")
+
+# test data
+#description = "test"
+```
+
+(2) ##################################################################
+Remove haplotypes with rank >2, separate hap1 and hap2 into different dataframes, then join them based on loc, ID
+```{r}
+microhap_report <- microhap_report[microhap_report$rank <= 2, ]
+microhap_report1 <- microhap_report[microhap_report$rank == 1, ]
+microhap_report2 <- microhap_report[microhap_report$rank == 2, ]
+hap1 <- microhap_report1 %>%
+  select(indiv.ID, locus, haplo, depth) %>%
+  unite(locID, locus, indiv.ID, sep = "-")
+hap2 <- microhap_report2 %>%
+  select(indiv.ID, locus, haplo, depth) %>%
+  unite(locID, locus, indiv.ID, sep = "-")
+# join the hap1 and hap1 dataframes together based on locID (does this leave blanks where hap2 is missing?). There should not be any homozygotes at this point, since hap2 is by definition a different haplotype.
+microhap_geno <- left_join(hap1, hap2, "locID")
+microhap_geno <- microhap_geno %>% 
+  select(locID, haplo.x, haplo.y, depth.x, depth.y) %>% 
+  separate(locID, c("locus", "id"), sep = "-", remove = FALSE)
+```
+
+(3) ##################################################################
+Remove "rejected" loci, based on exported "loc_annotation" file from Microhaplot
+```{r}
+loc_ann <- read.csv("10pcN_filter_locus_annotation_250518.csv", header = TRUE)
+row.names(loc_ann) <- loc_ann$locus
+loc_ann$rownum <- NULL
+# add the status column to the microhap report based on locus name in both files
+tgt1 <- left_join(microhap_geno, loc_ann, "locus")
+# keep only rows for which the locus status is "Accept". These are the loci that were accepted in Microhaplot loc annotation
+tgt2 <- tgt1[tgt1$status == "Accept", ]
+
+```
+
+(4) ##################################################################
+Remove genotypes with N and NA
+```{r}
+# first convert NA's to values so that homozygous genotypes have the same haplotype in haplo.x and haplo.y, and depth.y = 0.
+
+# convert haplotypes and counts from factors to characters and integers
+tgt2$haplo.x<-as.character(tgt2$haplo.x)
+tgt2$haplo.y<-as.character(tgt2$haplo.y)
+tgt2$depth.x<-ifelse(is.na(tgt2$depth.x), "0", tgt2$depth.x)
+tgt2$depth.y<-ifelse(is.na(tgt2$depth.y), "0", tgt2$depth.y)
+tgt2$depth.y<-as.integer(tgt2$depth.y) # was previously character
+
+tgt3 <- tgt2
+
+# Need to sort the allele order before making homozygotes of any genotypes.
+tgt4 <- unite(tgt3, hap_count.x, haplo.x, depth.x, sep = "_", remove = TRUE)
+tgt4 <- unite(tgt4, hap_count.y, haplo.y, depth.y, sep = "_", remove = TRUE)
+
+x1 <- as.character(tgt4[,4])
+x2 <- as.character(tgt4[,5])
+loc <- cbind(x1,x2) # hap_count.x=x1, hap_count.y=x2
+
+# remove the hap_count and gt columns from tgt4
+tgt4$hap_count.x<-NULL
+tgt4$hap_count.y<-NULL
+
+# now sort each row in loc, so that every instance of (2,1) becomes (1,2); need to include "NA, NA" rows or they 
+# collapse to single cell
+x.sort <- lapply(1:nrow(loc),function(j) {   #:nrow(loc)
+  row.j<-loc[j,]
+  if(any(is.na(row.j))) c(NA,NA) else sort(row.j, decreasing = FALSE)
+}) # this is now a list, not a dataframe; need to bind the rows into a character matrix
+loc<-do.call(rbind,x.sort)
+
+# now add "loc" df to tgt4
+tgt4 <- cbind(tgt4, loc)
+names(tgt4)[9] <- "hap_count.x"
+names(tgt4)[10] <- "hap_count.y"
+
+tgt4$hap_count.x<-as.character(tgt4$hap_count.x)
+tgt4$hap_count.y<-as.character(tgt4$hap_count.y)
+
+# and re-split haplo_count into haplo.x, depth.x and haplo.y, depth.y
+tgt4 <- tgt4 %>% 
+  select(locID, locus, id, hap_count.x, hap_count.y, status, comment) %>%
+  separate(hap_count.x, c("haplo.x", "depth.x"), sep = "_", remove = TRUE) %>%
+  separate(hap_count.y, c("haplo.y", "depth.y"), sep = "_", remove = TRUE)
+tgt4$depth.x<-as.numeric(tgt4$depth.x)
+tgt4$depth.y<-as.numeric(tgt4$depth.y)
+
+# set minimum read depth for called alleles (e.g., combined depth.x + depth.y >= 10)
+xalleles<-ifelse(tgt4$depth.x + tgt4$depth.y < 10, NA, tgt4$haplo.x)
+yalleles<-ifelse(tgt4$depth.x + tgt4$depth.y < 10, NA, tgt4$haplo.y)
+#then replace alleles column with low-depth genotypes changed to blank
+tgt4$haplo.x<-xalleles
+tgt4$haplo.y<-yalleles
+
+# There are heterozygotes called where the Allelic ratio is <0.3. Change them to homozygotes
+# as far as I can tell, there is no way to keep the depth order for homozygotes, since sometimes they
+# are the most common read and sort to the first column (e.g., when the second read is rare and eventually
+# removed), while other times the rare alternate allele sorts first, putting the most common allele in the second column. 
+# I've left them in both positions so that at least there are homozygotes along both axes in the plots.
+lofreqy <- ifelse(tgt4$depth.y / tgt4$depth.x < 0.3, tgt4$haplo.x, tgt4$haplo.y)
+lofreqx <- ifelse(tgt4$depth.x/tgt4$depth.y < 0.3, tgt4$haplo.y, tgt4$haplo.x) 
+tgt4$haplo.y<-lofreqy
+tgt4$haplo.x<-lofreqx
+
+# Finally, remove remaining haplotype rows if there are N's in the haplotypes.
+tgt4 <- subset(tgt4, !str_detect(haplo.x, "N"))
+tgt5 <- subset(tgt4, !str_detect(haplo.y, "N"))
+
+# create combined genotype column in tgt5
+tgt6 <- unite(tgt5, gt, haplo.x, haplo.y, sep = "/", remove = FALSE)
+```
+
+
+(5) ##################################################################
+(optional, as genotypes will likely change after checking plots and editing parameters)
+
+Now, let’s make a data frame where rows are IDs and columns are genotypes. First, we will select just the columns that we are going to need, and then name the loci with the positions in there.
+```{r}
+tmp <- tgt6 %>%
+  select(id, locus, haplo.x, haplo.y) %>%
+  unite(gt, haplo.x, haplo.y, sep = "/")
+
+# then use spreading operation to convert to a matrix of samples by loci
+wide <- tmp %>%
+  spread(key = locus, value = gt)
+#row.names(wide) <- wide$id
+# separate genotypes into 2 columns/locus
+gdata <- cbind(wide[, 1], alleleSplit(wide[, -1], sep = "/"))
+gdata <- as.data.frame(gdata)
+
+# look at a small part of that
+gdata[1:10, 1:10]
+# write csv file
+write.csv(gdata, paste(description, "_haplotable2.csv", sep = ""), row.names = FALSE)
+```
+
+(6) ##################################################################
+(optional; this might be helpful to see the data and sort haplotypes by locus, but can also be done with R table tgt6)
+
+Now, let’s make a data frame where rows are IDs and columns are genotypes with allele counts. First, we will select just the columns that we are going to need, and then name the loci with the positions in there.
+```{r}
+tmp <- tgt6 %>%
+  select(id, locus, haplo.x, haplo.y, depth.x, depth.y) %>%
+  unite(gt, haplo.x, haplo.y, sep = "/") %>%
+  unite(gt_counts, depth.x, depth.y, sep = "/") %>%
+  unite(gtypes, gt, gt_counts, sep = " ")
+# then use spreading operation to convert to a matrix of samples by loci
+wide <- tmp %>%
+  spread(key = locus, value = gtypes)
+# separate genotypes into 2 columns/locus
+#gdata <- cbind(wide[, 1], alleleSplit(wide[, -1], sep = "/"))
+
+gdata <- as.data.frame(wide)
+# look at a small part of that
+gdata[1:10, 1:10]
+# write csv file
+write.csv(gdata, paste(description, "_allelecount2.csv", sep = ""), row.names = FALSE)
+```
+
+(7) ##################################################################
+Plot the allele counts for reference (RO) and alternate (AO) allele for each locus?
+(this will not plot 3rd or 4th alleles, but will show the genotypes as different colors for genotypes that have a different allele (not ref or alt)
+```{r}
+# what do you want to call the saved pdf?
+pdfname = paste0(description, "_allele_multiplots2.pdf")
+# color-blind friendly palette with black: http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/
+#cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+# PM_palette1: c("blue1", "darkmagenta", "brown1", "aquamarine", "olivdrab4", "chartreuse", "deepskyblue", "gold", "hotpink", "yellow", "black", "gray40") # need to add more colors
+#library(randomcoloR)
+#n <- 30
+#palette <- distinctColorPalette(n)
+#"#EBC8CB", "#9C808E", "#77E36C", "#A0EAD4", "#7CB4EC", "#DA7D79", "#D0EC7B", "#DCC24D", "#C3E0E5", "#C0EBAD", "#D48EE5", "#DD79B5", "#7AE9A0", "#E24073", "#6B9877", "#735DD4", "#61DDE6", "#D5883E", "#CCEC41", "#87B25C", "#913AE5", "#5DE3C4", "#E3DB97", "#DE56D6", "#80F442", "#DBE2CA", "#D0B7E2", "#7B84D0", "#68A6BA", "#D8AE89"
+
+# need to convert read.depth 1, 2 for homozygotes to just read.depth.1 or read.depth.2
+# because microhaplot exports only 1 allele count for homozygotes
+tmp2 <- tgt6 %>%
+  select(id, locus, haplo.x, haplo.y, depth.x, depth.y) %>%  
+  unite(gt, haplo.x, haplo.y, sep = "/")
+tmp2 <- tmp2[order(tmp2[,2]),]
+
+loci<-unique(tmp2$locus)
+#   loctest<-c("Loc_10", "Loc_101", "Loc_102", "Loc_181")
+
+#extract data for each locus sequentially and plot
+pdf(pdfname) #
+  for(i in loci) {   #use loctest instead of loci to test before running on all loci
+locus <- i
+loc2plot<-as.data.frame(subset(tmp2, locus == i, select=c(id, locus, gt, depth.x, depth.y)))
+#loc2plot$A2<-as.numeric(loc2plot$A2)
+maxRO<-max(loc2plot$depth.x, na.rm = TRUE)
+maxAO<-max(loc2plot$depth.y, na.rm = TRUE)
+range<-as.numeric(c(maxRO,maxAO))
+plot_limit<-(min(range)+100)
+
+# plot data, with diagonal lines for AR=0.3 (blue) and AR=0.4 (red)
+o = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+p = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, plot_limit) + ylim(0, plot_limit) + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+q = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, 100) + ylim(0, 100) + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+r = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, 1000) + ylim(0, 1000) + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+ggplot2.multiplot(o,q, cols=1) # 2 graphs per locus
+#ggplot2.multiplot(o,r,q, cols=1)# 3 graphs per locus
+}
+dev.off()
+
+```
+
+(8) #################################################################
+Use multiplot figures to check each locus for errors in calls due to minimum depth, Allelic Ratio (AR), or uncallable (to be removed). Add notes to a spreadsheet so that all loci can be updated with new AR, new minDP, or excluded, and then new plots and tables exported.
+
+Once that's done, generate new .csv file containing columns for each locus for:
+  1) status (loci to Accept/Reject)
+  2) minDP (include default value and changed values (e.g., default = 10))
+  3) AR (include default value and changed values (e.g., default = 0.3))
+  column headings: locus, minDP, AR, status (#others OK, but only these are used)
+
+THIS MAY NEED TO BE DONE SEVERAL TIMES TO VERIFY THAT THE CHANGES ARE SUFFICIENT. Each time, the updated spreadsheet (or a new spreadsheet) can be used to modify the settings for all loci in tgt6.  
+```{r}
+# Remove loci first (this is in addition to #3 above)
+tgt6$status <- NULL # removes status column before re-doing status filter.
+loc_ann <- read.csv("multiplot_loc_edit_130618.csv", header = TRUE)
+row.names(loc_ann) <- loc_ann$locus
+loc_ann$locus <- as.factor(loc_ann$locus)
+# add the status column to the microhap report based on locus name in both files
+tgt7 <- left_join(tgt6, loc_ann, "locus")
+# keep only rows for which the locus status is "Accept". These are the loci that were accepted in Microhaplot loc annotation
+tgt7 <- tgt7[tgt7$status == "Accept", ]
+
+# Now change genotypes to NA if the combined read depth (depth.x + depth.y) is less than the minDP number for each locus
+xalleles<-ifelse(tgt7$depth.x + tgt7$depth.y < tgt7$minDP, NA, tgt7$haplo.x)
+yalleles<-ifelse(tgt7$depth.x + tgt7$depth.y < tgt7$minDP, NA, tgt7$haplo.y)
+#then replace alleles column with low-depth genotypes changed to blank
+tgt7$haplo.x<-xalleles
+tgt7$haplo.y<-yalleles
+
+# Then change genotype calls by AR
+lofreqy <- ifelse(tgt7$depth.y / tgt7$depth.x < tgt7$AR, tgt7$haplo.x, tgt7$haplo.y)
+lofreqx <- ifelse(tgt7$depth.x/tgt7$depth.y < tgt7$AR, tgt7$haplo.y, tgt7$haplo.x) 
+tgt7$haplo.y<-lofreqy
+tgt7$haplo.x<-lofreqx
+
+# check that AR was applied
+tgt7$ARactual <- ifelse(tgt7$depth.x<tgt7$depth.y,tgt7$depth.x/tgt7$depth.y,tgt7$depth.y/tgt7$depth.x)
+# select a locus with a new AR, sort by ARactual, then look at the haplo.x and haplo.y alleles compared to 
+# the gt call for genotypes with ARactual just above and below the specified AR. Those below should be
+# homozygotes in the haplo columns (and previously het in the gt column if >0.3), and those above the 
+# specified AR will be hets.
+
+# replace the called genotypes with the combined genotype column in tgt7$gt
+tgt7 <- unite(tgt7, gt, haplo.x, haplo.y, sep = "/", remove = FALSE)
+
+```
+
+
+(9) ##################################################################
+# The genotypes should now be re-called based on the multiplot edits, and should be re-plotted and re-checked for those that were changed. To make this easier, only replot those with status = Accept, AR>0.3 and minDP>10 (the default levels).
+
+```{r}
+# what do you want to call the saved pdf?
+pdfname = paste0(description, "_allele_multiplots_recheck2.pdf")
+
+# First select only the changed loci:
+tgt7_recalled <- subset(tgt7, !(minDP==10 & AR==0.3 & status=="Accept"))
+
+# need to convert read.depth 1, 2 for homozygotes to just read.depth.1 or read.depth.2
+# because microhaplot exports only 1 allele count for homozygotes
+tmp2 <- tgt7_recalled %>%
+  select(id, locus, haplo.x, haplo.y, depth.x, depth.y) %>%  
+  unite(gt, haplo.x, haplo.y, sep = "/")
+tmp2 <- tmp2[order(tmp2[,2]),]
+
+loci<-unique(tmp2$locus)
+#   loctest<-c("Loc_10", "Loc_101", "Loc_102", "Loc_181")
+
+#extract data for each locus sequentially and plot
+pdf(pdfname) #
+  for(i in loci) {   #use loctest instead of loci to test before running on all loci
+locus <- i
+loc2plot<-as.data.frame(subset(tmp2, locus == i, select=c(id, locus, gt, depth.x, depth.y)))
+#loc2plot$A2<-as.numeric(loc2plot$A2)
+maxRO<-max(loc2plot$depth.x, na.rm = TRUE)
+maxAO<-max(loc2plot$depth.y, na.rm = TRUE)
+range<-as.numeric(c(maxRO,maxAO))
+plot_limit<-(min(range)+100)
+
+# plot data, with diagonal lines for AR=0.3 (blue) and AR=0.4 (red)
+o = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+p = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, plot_limit) + ylim(0, plot_limit) + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+q = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, 100) + ylim(0, 100) + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+r = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, 1000) + ylim(0, 1000) + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+#ggplot2.multiplot(o,q, cols=1) # 2 graphs per locus
+ggplot2.multiplot(o,r,q, cols=1)# 3 graphs per locus
+}
+dev.off()
+
+```
+
+(10) ##################################################################
+  MAKE CHANGES TO INDIVIDUAL GENOTYPES IN THE RE-CALLED GENOTYPE DATAFRAME "tgt7"
+  Do this by copying the following lines and inserting the appropriate locus-sample line to re-call or change to NA
+  
+  Not sure how to do this or if it's worthwhile for a few genotypes in a small portion of the loci. Lots of leg work and potential guessing about what the genotype should be because the second allele isn't always knowns (e.g., if it's been called a homozygote, but falls just below the AR away from the rest of the homozygotes). 
+```{r}
+# make new df with only relevant columns
+tgt8 <- select(tgt7, locID, locus, id, haplo.x, haplo.y, depth.x, depth.y, AR, ARactual)
+
+# example edit lines:
+
+#replace tgt8$haplo.x = NA & tgt8$haplo.y = NA if tgt8$locID == "Loc_110-156881"
+#filter, rbind(
+#NA_genotypes <- c("Loc_110-156881", "Loc_110-17251", "Loc_110-123922", "Loc_158-715", "Loc_158-4844", "Loc_158-1354", "Loc_158-715", )  
+
+```
+
+  
+(11) ##################################################################
+approved, print final plots for all "accepted" loci, and export the "final" genotype tables
+```{r}
+tmp <- tgt8 %>%
+  select(id, locus, haplo.x, haplo.y) %>%
+  unite(gt, haplo.x, haplo.y, sep = "/")
+
+# then use spreading operation to convert to a matrix of samples by loci
+wide <- tmp %>%
+  spread(key = locus, value = gt)
+#row.names(wide) <- wide$id
+# separate genotypes into 2 columns/locus
+gdata <- cbind(wide[, 1], alleleSplit(wide[, -1], sep = "/"))
+gdata <- as.data.frame(gdata)
+
+# look at a small part of that
+gdata[1:10, 1:10]
+# write csv file
+write.csv(gdata, paste(description, "_haplotable_final.csv", sep = ""), row.names = FALSE)
+
+###############################
+# OPTIONAL: make a haplotype table with depth per allele
+tmp <- tgt8 %>%
+  select(id, locus, haplo.x, haplo.y, depth.x, depth.y) %>%
+  unite(gt, haplo.x, haplo.y, sep = "/") %>%
+  unite(gt_counts, depth.x, depth.y, sep = "/") %>%
+  unite(gtypes, gt, gt_counts, sep = " ")
+# then use spreading operation to convert to a matrix of samples by loci
+wide <- tmp %>%
+  spread(key = locus, value = gtypes)
+# separate genotypes into 2 columns/locus
+#gdata <- cbind(wide[, 1], alleleSplit(wide[, -1], sep = "/"))
+
+gdata <- as.data.frame(wide)
+# look at a small part of that
+gdata[1:10, 1:10]
+# write csv file
+write.csv(gdata, paste(description, "_allelecount_final.csv", sep = ""), row.names = FALSE)
+
+###############################
+# generate final plots for all "accepted" loci
+# what do you want to call the saved pdf?
+pdfname = paste0(description, "_microhap_multiplots_final.pdf")
+
+# need to convert read.depth 1, 2 for homozygotes to just read.depth.1 or read.depth.2
+# because microhaplot exports only 1 allele count for homozygotes
+tmp2 <- tgt8 %>%
+  select(id, locus, haplo.x, haplo.y, depth.x, depth.y) %>%  
+  unite(gt, haplo.x, haplo.y, sep = "/")
+tmp2 <- tmp2[order(tmp2[,2]),]
+
+loci<-unique(tmp2$locus)
+#   loctest<-c("Loc_10", "Loc_101", "Loc_102", "Loc_181")
+
+#extract data for each locus sequentially and plot
+pdf(pdfname) #
+  for(i in loci) {   #use loctest instead of loci to test before running on all loci
+locus <- i
+loc2plot<-as.data.frame(subset(tmp2, locus == i, select=c(id, locus, gt, depth.x, depth.y)))
+#loc2plot$A2<-as.numeric(loc2plot$A2)
+maxRO<-max(loc2plot$depth.x, na.rm = TRUE)
+maxAO<-max(loc2plot$depth.y, na.rm = TRUE)
+range<-as.numeric(c(maxRO,maxAO))
+plot_limit<-(min(range)+100)
+
+# plot data, with diagonal lines for AR=0.3 (blue) and AR=0.4 (red)
+o = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+p = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, plot_limit) + ylim(0, plot_limit) + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+q = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, 100) + ylim(0, 100) + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+r = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, 1000) + ylim(0, 1000) + scale_colour_manual(values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", "#D14285", "#6DDE88", "#652926", "#7FDCC0", "#C84248", "#8569D5", "#5E738F", "#D1A33D", "#8A7C64", "#599861")) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+#ggplot2.multiplot(o,q, cols=1) # 2 graphs per locus
+ggplot2.multiplot(o,r,q, cols=1)# 3 graphs per locus
+}
+dev.off()
+
+
+```
+
+
+(12) ##################################################################
+convert full data set to reduced column dataframe for import to database (1 row per genotype).
+```{r}
+# Then make data frame of reduced columns, and remove "Ppho" from beginning of sample IDs (to leave just LABIDs)
+tmp3 <- tgt8 %>%
+  select(id, locus, haplo.x, haplo.y, depth.x, depth.y)
+write.csv(tmp3, paste0(description, "_final_microhap_data_for_DB.csv"), row.names = FALSE)
+# saving the data this way gets around issue in Access of allowing only ~250 columns. Data will need to be converted to a matrix of samples by loci (and split columns for alleles) either using a cross-tab table in Access or an R script (e.g., #14 above). 
+```
+
+
+
+
+
+
+
+
+
+
+
+
